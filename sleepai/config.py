@@ -81,7 +81,7 @@ class Config:
     base_model: str = "Qwen/Qwen3-1.7B"
     # Skill packs the model must keep while learning (sleepai/skills.py): all protected; how much
     # each is rehearsed follows the user's own episodes, so there is nothing to set here.
-    skills: list = field(default_factory=lambda: ["general", "reasoning", "writing", "coding"])
+    skills: list = field(default_factory=lambda: ["general", "reasoning", "writing", "coding", "reading"])
     autonomy_level: int = 0
     seed: int = 0
     sleep: SleepConfig = field(default_factory=SleepConfig)

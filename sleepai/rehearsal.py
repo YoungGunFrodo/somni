@@ -89,12 +89,27 @@ def build_rehearsal(home: Path, base_model: str, skills: list[str] | None = None
             rows = [{"q": q, "a": a.text, "skill": k} for k, qs, ans in (("general", GENERAL, gen), ("coding", CODING, code))
                     for q, a in zip(qs, ans)]
         else:
+            from .reading import prompt_parts
             for pack in packs:
-                ans = s.answer_many(pack.rehearsal, max_new_tokens=pack.max_new_tokens)
-                rows += [{"q": q, "a": a.text, "skill": pack.name} for q, a in zip(pack.rehearsal, ans)]
+                items = [prompt_parts(r) if isinstance(r, dict) else (r, None) for r in pack.rehearsal]
+                ans = s.answer_many([q for q, _ in items], [c for _, c in items],
+                                    max_new_tokens=pack.max_new_tokens)
+                rows += [{"q": q, "a": a.text, "skill": pack.name,
+                          "ctx": [{"key": m.key, "summary": m.summary, "id": m.id} for m in c or []]}
+                         for (q, c), a in zip(items, ans)]
         rows = [r for r in rows if r["a"].strip()]
         path.write_text(json.dumps(rows, indent=1), encoding="utf-8")
-    return [TrainingExample(r["q"], r["a"], 1.0, "base", f"skill:{r.get('skill', '')}") for r in rows]
+    return [TrainingExample(r["q"], r["a"], 1.0, "base", f"skill:{r.get('skill', '')}",
+                            context=context_from(r.get("ctx"))) for r in rows]
+
+
+def context_from(rows):
+    """Stored context (key/summary/id dicts) back into memory-file objects, or None."""
+    if not rows:
+        return None
+    from .memory.store import Memory
+    return [Memory(key=c["key"], type="file", summary=c["summary"], strength="verified", status="active",
+                   id=c.get("id", c["key"])) for c in rows]
 
 
 def sample(base_replay: list[TrainingExample], k: int, rng, weights: dict | None = None) -> list[TrainingExample]:

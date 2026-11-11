@@ -243,7 +243,9 @@ def eval_only(args, out, qas, report) -> int:
     ans = student.answer_many([qa["q"] + " Answer briefly." for qa in qas], ctx)
     report["ours_with_lookup"] = sum(any(answers_match(a.text, g) for g in qa["answers"])
                                      for qa, a in zip(qas, ans)) / len(qas)
-    print(f"[squad] ours + memory lookup (memories and files): {100 * report['ours_with_lookup']:.1f}%", flush=True)
+    report["routed_to_reading"] = getattr(student, "last_routed", 0) / len(qas)
+    print(f"[squad] ours + memory lookup (memories and files): {100 * report['ours_with_lookup']:.1f}% "
+          f"({100 * report['routed_to_reading']:.0f}% read with experts off)", flush=True)
     report["published"] = {"model": "Qwen2.5-7B", "base": 0.319, "sft": 0.320, "seal": 0.432, "google_sleep": 0.462}
     report["gain_over_base"] = {"ours": report["ours"] - report["base"], "seal": 0.432 - 0.319,
                                 "google_sleep": 0.462 - 0.319}

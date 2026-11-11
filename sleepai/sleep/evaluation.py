@@ -84,10 +84,12 @@ def _score(student, probes, mode="correct") -> np.ndarray:
             answers = [student.answer(p["question"]) for p in probes]
         return np.array([python_tests(extract_code(a.text), p["tests"])[0]
                          for p, a in zip(probes, answers)], dtype=bool)
+    from ..rehearsal import context_from          # reading probes carry their passage
+    ctxs = [context_from(p.get("context")) for p in probes]
     if hasattr(student, "answer_many"):         # real student: batched generation, same answers
-        answers = student.answer_many([p["question"] for p in probes])
+        answers = student.answer_many([p["question"] for p in probes], ctxs if any(ctxs) else None)
     else:
-        answers = [student.answer(p["question"], context=None) for p in probes]
+        answers = [student.answer(p["question"], context=c) for p, c in zip(probes, ctxs)]
     for p, ans in zip(probes, answers):
         if mode == "correct":
             out.append(answers_match(ans.value, p["answer"]))

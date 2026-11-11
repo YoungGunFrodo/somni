@@ -72,7 +72,7 @@ def _teacher_pairs(system, m, n: int) -> list[tuple[str, str]]:
 
 
 def build_examples(system, memories, n_per_memory: int, origin: str) -> list[TrainingExample]:
-    out = []
+    out, lookups = [], []
     rich = hasattr(system.teacher, "training_pairs")
     for m in memories:
         weight = 1.0
@@ -92,13 +92,48 @@ def build_examples(system, memories, n_per_memory: int, origin: str) -> list[Tra
                 styled = (styled[start:] + styled[:start])[:k]
             if pairs or styled:
                 out += [TrainingExample(q, a, weight, kind, m.id) for q, a in pairs]
-                out += [TrainingExample(q, m.value, weight, kind, m.id) for q in styled]
+                # Short and long answers mixed: bare values only trained a "flashcard" habit
+                # (fragment answers, even when a passage was given).
+                full = m.summary if str(m.value).lower() in str(m.summary).lower() else m.value
+                out += [TrainingExample(q, m.value if i % 2 == 0 else full, weight, kind, m.id)
+                        for i, q in enumerate(styled)]
                 if origin == "new":
-                    out += lookup_examples(system, m, [q for q, _ in pairs] + styled, weight, kind)
+                    lx = lookup_examples(system, m, [q for q, _ in pairs] + styled, weight, kind)
+                    lookups += [(e, m) for e in lx]
+                    out += lx
                 continue
         for q in system.teacher.training_questions(m, n_per_memory):
             out.append(TrainingExample(q, m.value, weight, kind, m.id))
+    if lookups:
+        base_reading_answers(system, lookups)
     return out
+
+
+def base_reading_answers(system, lookups) -> None:
+    """Lookup practice answered the way the BASE model reads: the untouched base model answers
+    each question from its retrieved context, and its answer is kept only if it contains the
+    memory's value (checked); otherwise the plain value stays. The trained model then learns to
+    read like the base instead of answering in fragments. Real backend only; cached per question
+    in <home>/lookup_answers.json so replay and second takes never regenerate."""
+    if getattr(system.config, "backend", "toy") == "toy":
+        return
+    import json
+    from ..models.base import answers_match
+    path = system.home / "lookup_answers.json"
+    cache = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    todo = [(e, m) for e, m in lookups if f"{e.question}|{m.value}" not in cache]
+    if todo:
+        from ..models.hf import HFStudent
+        base = HFStudent(system.config.base_model, max_new_tokens=96)
+        answers = base.answer_many([e.question for e, _ in todo], [e.context for e, _ in todo])
+        for (e, m), a in zip(todo, answers):
+            cache[f"{e.question}|{m.value}"] = a.text if answers_match(a.text, str(m.value)) else ""
+        path.write_text(json.dumps(cache), encoding="utf-8")
+    for e, m in lookups:
+        text = cache.get(f"{e.question}|{m.value}", "")
+        if text:
+            cite = e.answer.split("\n[memory:", 1)[1] if "\n[memory:" in e.answer else ""
+            e.answer = text.strip() + (f"\n[memory:{cite}" if cite else "")
 
 
 def lookup_examples(system, m, questions: list, weight: float, kind: str) -> list[TrainingExample]:

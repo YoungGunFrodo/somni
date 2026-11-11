@@ -21,13 +21,13 @@ from dataclasses import dataclass
 import re
 from typing import Callable
 
-DEFAULT_SKILLS = ["general", "reasoning", "writing", "coding"]
+DEFAULT_SKILLS = ["general", "reasoning", "writing", "coding", "reading"]
 
 
 @dataclass
 class SkillPack:
     name: str
-    rehearsal: list[str]
+    rehearsal: list            # prompts (str), or reading items (dict: passage + question)
     max_new_tokens: int = 128                       # length of the base answers kept for rehearsal
     probes: Callable[[], list[dict]] | None = None  # held-out gate probes (None = no gate)
     probe_mode: str = "correct"                     # "correct" (contains answer) | "python" (unit tests)
@@ -114,12 +114,14 @@ _CODE = re.compile(r"```|\bdef \w+\(|\bclass \w+|\bimport \w+|\bfunction\b|Trace
                    r"\.(py|js|ts|java|cpp|rs|go)\b|\bSELECT\b.+\bFROM\b|\bgit \w+|\bnpm \w+", re.I)
 _MATH = re.compile(r"\d+\s*[-+*/x%^]\s*\d+|\b(calculate|how many|how much|percent|average|probability|"
                    r"solve|equation)\b", re.I)
+_READ = re.compile(r"\[document:|here is a (document|text|passage|article)|according to (the|this)|"
+                   r"\b(read|summari[sz]e) (this|the following)\b", re.I)
 _WRITE = re.compile(r"\b(rewrite|reword|summari[sz]e|draft|essay|letter|email|paragraph|proofread|"
                     r"translate|story|poem|tone|grammar)\b", re.I)
 
 
 def _packs() -> dict[str, SkillPack]:
-    from . import evalsets, rehearsal
+    from . import evalsets, reading, rehearsal
     return {
         "general": SkillPack("general", rehearsal.GENERAL, 96, evalsets.general_probes,
                              notes="gated by 'general' and 'drift-vs-base'"),
@@ -130,6 +132,11 @@ def _packs() -> dict[str, SkillPack]:
         "coding": SkillPack("coding", rehearsal.CODING, 384, evalsets.coding_probes, "python",
                             detect=lambda t: bool(_CODE.search(t)),
                             notes="gated by 'coding': no previously passing task may fail"),
+        # Reading (sleepai/reading.py): answer from a passage you are given. Memory lookup,
+        # memory files and pasted documents all depend on it.
+        "reading": SkillPack("reading", reading.rehearsal_items(), 96, reading.probes,
+                             detect=lambda t: bool(_READ.search(t)) or len(t) > 1500,
+                             notes="gated by 'skill:reading' (invented passages, never SQuAD)"),
     }
 
 

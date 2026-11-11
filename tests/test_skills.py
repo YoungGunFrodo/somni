@@ -36,7 +36,7 @@ class SkillTests(unittest.TestCase):
         w = skills.usage_weights(self.store, 10, ALL)
         self.assertEqual(set(w), set(ALL))
         for v in w.values():
-            self.assertAlmostEqual(v, 0.25)
+            self.assertAlmostEqual(v, 1 / len(ALL))
 
     def test_coder_gets_more_code_but_every_pack_keeps_a_floor(self):
         for i in range(20):
@@ -45,7 +45,7 @@ class SkillTests(unittest.TestCase):
         w = skills.usage_weights(self.store, 10, ALL)
         self.assertGreater(w["coding"], 0.5)
         for name in ALL:
-            self.assertGreaterEqual(w[name], 0.125 - 1e-9)      # half of an even share
+            self.assertGreaterEqual(w[name], 0.5 / len(ALL) - 1e-9)      # half of an even share
         self.assertAlmostEqual(sum(w.values()), 1.0)
 
     def test_writer_gets_more_writing(self):
@@ -58,7 +58,7 @@ class SkillTests(unittest.TestCase):
         for _ in range(10):
             self.say("def f(): pass  # import os", day=0)
         w = skills.usage_weights(self.store, 100, ALL, window_days=30)
-        self.assertAlmostEqual(w["coding"], 0.25)
+        self.assertAlmostEqual(w["coding"], 1 / len(ALL))
 
     def test_sample_follows_weights(self):
         rng = np.random.default_rng(0)

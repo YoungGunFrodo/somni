@@ -357,3 +357,21 @@ still 100%). Toy numbers are pipeline dynamics, not LLM performance.
   with their memory/file in context (keep reading the context a trained skill).
 - A Windows Update restart (not a crash) cut off the first scoring; `--eval-only` re-scores saved experts,
   and long-run scripts now warn when a Windows restart is pending (`sleepai/resources.py`).
+
+### SQuAD v2 + reading (2026-11-11)
+- v2 = lookup practice (2 per memory, value + citation): no context 27.2% (+16.6), trained + lookup
+  **39.9%** (worse than v1 43.6%); base + lookup 77.6%. Lookup practice as built did NOT fix reading.
+- Diagnosis (200 questions): recall finds the gold passage 94% of the time; given it, base answers
+  82%, trained 45% (fragment answers, wrong memory's value, leaked memory-list formatting).
+  Cause: rehearsal had NO passages, so reading was never protected; bare-value answers trained a
+  flashcard habit.
+- Routing (experts off when `match_strength` >= 0.3; `HFStudent.route_threshold`): trained + lookup
+  75.8% (92% routed). Kept as an option, OFF by default: the user wants the trained model to read
+  as well as the base (documents and tool output fail the same way).
+- New reading skill pack + gate `skill:reading` (user-approved 2026-11-11; `sleepai/reading.py`,
+  invented passages, memory-file and pasted presentations, 40 held-out probes, 48 rehearsal items).
+  On the v2 SQuAD night: base 97.5%, trained **55.0%** -> the gate would have rejected it.
+- Also built (not yet trained, waiting for the user's go): lookup practice answered by the base
+  model reading the context (kept only if it contains the value, cached in lookup_answers.json),
+  styled answers alternate bare value / full sentence.
+- The user said: do not start new training until they say so.

@@ -54,7 +54,7 @@ def _module_class():
 
         def forward(self, x):
             y = self.base(x)
-            if not len(self.A):
+            if not len(self.A) or self.ctx.get("off"):    # off: the base model alone (reads memory)
                 return y
             # Compute in the model's dtype (bf16 on the GPU): an fp32 copy of every layer input
             # used several GB of extra VRAM. Only the small gate dot product runs in fp32.

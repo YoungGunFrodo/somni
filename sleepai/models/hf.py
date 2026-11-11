@@ -67,7 +67,8 @@ def _load(base_model: str, adapter_dir: str | None):
                                                      device_map=device)
     from .experts import is_expert_dir, load_into
     if adapter_dir and is_expert_dir(adapter_dir):      # gated experts (models/experts.py)
-        load_into(model, adapter_dir)
+        model._expert_ctx = {}
+        load_into(model, adapter_dir, model._expert_ctx)
     elif adapter_dir:
         from peft import PeftModel
         model = PeftModel.from_pretrained(model, adapter_dir).to(device)
@@ -102,6 +103,11 @@ class HFTeacher:
 
 
 class HFStudent:
+    # Lookup routing (SQuAD finding): trained experts make the model worse at READING memory
+    # (given the right passage: base 82% vs trained 45%), so when recall found a strong match
+    # the base model answers with the experts switched off. None = always use the experts.
+    route_threshold: float | None = None
+
     def __init__(self, base_model: str, max_new_tokens: int = 48, batch_size: int = 16):
         self.base_model = base_model
         self.adapter_dir: str | None = None
@@ -135,14 +141,31 @@ class HFStudent:
         max_new = max_new_tokens or self.max_new_tokens
         model, tok = _load(self.base_model, self.adapter_dir)
         prompts = self._prompts(list(zip(questions, contexts)))
-        texts = []
-        for i in range(0, len(prompts), self.batch_size):
-            enc = tok(prompts[i:i + self.batch_size], return_tensors="pt", padding=True,
-                      add_special_tokens=False).to(model.device)
-            with torch.no_grad():
-                gen = model.generate(**enc, max_new_tokens=max_new, do_sample=False,
-                                     pad_token_id=tok.pad_token_id)
-            texts += tok.batch_decode(gen[:, enc.input_ids.shape[1]:], skip_special_tokens=True)
+        ectx = getattr(model, "_expert_ctx", None)
+        read = [False] * len(prompts)
+        if ectx is not None and self.route_threshold is not None:
+            from ..wake.orchestrator import match_strength
+            read = [bool(c) and match_strength(q, c) >= self.route_threshold for q, c in zip(questions, contexts)]
+        self.last_routed = sum(read)
+        texts = [""] * len(prompts)
+        for mode in (False, True):                   # experts on, then off (reading memory)
+            idx = [i for i in range(len(prompts)) if read[i] == mode]
+            if ectx is not None:
+                ectx["off"] = mode
+            try:
+                for j in range(0, len(idx), self.batch_size):
+                    part = idx[j:j + self.batch_size]
+                    enc = tok([prompts[i] for i in part], return_tensors="pt", padding=True,
+                              add_special_tokens=False).to(model.device)
+                    with torch.no_grad():
+                        gen = model.generate(**enc, max_new_tokens=max_new, do_sample=False,
+                                             pad_token_id=tok.pad_token_id)
+                    for i, t in zip(part, tok.batch_decode(gen[:, enc.input_ids.shape[1]:],
+                                                           skip_special_tokens=True)):
+                        texts[i] = t
+            finally:
+                if ectx is not None:
+                    ectx["off"] = False
         out = []
         for text, context in zip(texts, contexts):
             text, used = cited_memory(text.strip(), context)

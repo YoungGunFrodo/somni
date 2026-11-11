@@ -8,6 +8,19 @@ from ..memory.store import MemoryStore
 from ..models.base import ABSTAIN, Answer
 
 
+_STOP = set("what which when where who whom whose how why does did was were the and for with that "
+            "this from are is of in to a an by on at as it its be".split())
+
+
+def match_strength(question: str, context) -> float:
+    """Share of the question's content words found in the best retrieved memory or memory file
+    (0..1). Used to route: a strong match is read by the base model with the experts off."""
+    terms = {w for w in re.findall(r"[a-z0-9]+", question.lower()) if len(w) > 2 and w not in _STOP}
+    if not terms or not context:
+        return 0.0
+    return max(sum(w in (c.summary + " " + c.key).lower() for w in terms) / len(terms) for c in context)
+
+
 class Orchestrator:
     def __init__(self, store: MemoryStore, student, use_memory: bool = True):
         self.store = store
