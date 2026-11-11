@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+/results/
+.sleep-ai/
+.venv/
+/tools/
+.venv-gpu/
+/models/
