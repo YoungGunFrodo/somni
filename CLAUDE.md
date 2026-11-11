@@ -230,7 +230,10 @@ still 100%). Toy numbers are pipeline dynamics, not LLM performance.
      `repair_max=64`). Measured: damage hits memories at random regardless of use (salience >= 4:
      14.7% lose recall, < 2: 17.0%), which is why. No gain in the toy (its practice questions
      overlap training); kept for real models.
-9. **GitHub** — `gh` installed (C:\Program Files\GitHub CLI). The user must run `gh auth login`
+9. ~~**GitHub**~~ — DONE (2026-11-11): project named **SOMNI** (Sleep-Optimized Memory for Neural
+   Intelligence), MIT license (YoungGunFrodo; the user may switch to their real name before going public:
+   LICENSE + docs/design.md byline), pushed PRIVATE to YoungGunFrodo/somni as one squashed commit
+   (old history in local branch `backup-before-squash`, never push it). Earlier notes: `gh` installed (C:\Program Files\GitHub CLI). The user must run `gh auth login`
    once. Repo starts PRIVATE, to be made public later: no personal data allowed (paths, usernames,
    emails, claude.ai links checked). The user reviews README.md before the first push. Squash the
    local history into one clean commit before the first push (early commits had a local path).
