@@ -29,6 +29,7 @@ class SleepConfig:
     replay_ratio: float = 1.0           # extra replay examples per new example (importance-sampled)
     replay_coverage: bool = True        # every protected memory gets one replay example each sleep
     base_replay_ratio: float = 1.0      # base-knowledge examples per training example
+    rehearsal_min_share: float = 0.2    # rehearsal repeated up to this share when the pool is small
     paraphrases_per_memory: int = 6
     max_new_per_sleep: int = 16         # sleep budget; the rest waits for the next sleep
     rebuild_every: int = 10             # full rebuild from base every N sleeps
@@ -64,7 +65,7 @@ class SleepConfig:
     # Lookup practice: per new memory, this many training questions carry what wake's recall
     # actually retrieves (memories + memory files, distractors included), so the trained model
     # keeps reading its memory. Without it, SQuAD lookup fell from 75.0% to 43.6% after training.
-    lookup_practice: int = 2
+    lookup_practice: int = 4   # candidates per memory; only base-verified ones are kept (about half)
 
 
 @dataclass

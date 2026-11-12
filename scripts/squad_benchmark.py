@@ -86,6 +86,22 @@ def ask_all(student, qas, batch=16):
                                    for qa, a in list(zip(qas, answers))[:8]]
 
 
+def skill_scores(student) -> dict:
+    """Held-out skill probes (the same sets the sleep gates use): reading and general knowledge."""
+    from sleepai import evalsets, reading
+    from sleepai.sleep.evaluation import _score
+    return {"reading": float(_score(student, reading.probes()).mean()),
+            "general": float(_score(student, evalsets.general_probes()).mean())}
+
+
+def lookup_score(student, store, qas) -> float:
+    from sleepai.wake.orchestrator import Orchestrator
+    orch = Orchestrator(store, student)
+    ctx = [orch.recall(qa["q"]) for qa in qas]
+    ans = student.answer_many([qa["q"] + " Answer briefly." for qa in qas], ctx)
+    return sum(any(answers_match(a.text, g) for g in qa["answers"]) for qa, a in zip(qas, ans)) / len(qas)
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--model", default="Qwen/Qwen3-1.7B")
@@ -96,6 +112,10 @@ def main() -> int:
     p.add_argument("--trainer", default="experts", choices=["experts", "peft"])
     p.add_argument("--slots", type=int, default=8)
     p.add_argument("--port", type=int, default=8092)
+    p.add_argument("--no-rehearsal", action="store_true",
+                   help="train without the skill packs' rehearsal (v1/v2 runs did; the real pipeline never does)")
+    p.add_argument("--lookup-practice", type=int, default=None, help="lookup practice examples per memory")
+    p.add_argument("--tag", default="", help="suffix for the output folder (experiments)")
     p.add_argument("--eval-only", action="store_true",
                    help="score the experts a previous run already trained (e.g. after a Windows restart)")
     args = p.parse_args()
@@ -109,7 +129,7 @@ def main() -> int:
     from sleepai.sleep.formation import run_formation
     from sleepai.system import build_real_system
 
-    out = ROOT / "models" / "squad" / f"{args.model.replace('/', '--')}-{args.passages}"
+    out = ROOT / "models" / "squad" / f"{args.model.replace('/', '--')}-{args.passages}{args.tag}"
     out.mkdir(parents=True, exist_ok=True)
     passages = load_squad(args.passages)
     qas = [qa for ps in passages for qa in ps["qas"]]
@@ -122,7 +142,9 @@ def main() -> int:
     # 1. base model, no context
     base = HFStudent(args.model, max_new_tokens=32)
     report["base"], report["base_samples"] = ask_all(base, qas)
-    print(f"[squad] base model, no context: {100 * report['base']:.1f}%")
+    print(f"[squad] base model, no context: {100 * report['base']:.1f}%", flush=True)
+    report["base_skills"] = skill_scores(base)
+    print(f"[squad] base skills: {report['base_skills']}", flush=True)
 
     # 2. our pipeline: wake (documents) -> memory formation -> consolidation
     home = out / "home"
@@ -130,7 +152,10 @@ def main() -> int:
     shutil.rmtree(home, ignore_errors=True)
     cfg = Config(home=str(home), backend="real", trainer=args.trainer, base_model=args.model,
                  sleep=SleepConfig(max_new_per_sleep=100000, paraphrases_per_memory=args.pairs,
-                                   epochs=args.epochs, replay=False, dreaming=args.dreaming, forgetting=False))
+                                   epochs=args.epochs, replay=not args.no_rehearsal, dreaming=args.dreaming,
+                                   forgetting=False))
+    if args.lookup_practice is not None:
+        cfg.sleep.lookup_practice = args.lookup_practice
     system = build_real_system(cfg)
     clear_cache()
     # On-demand teacher (GPU turn-taking): up for teacher phases, stopped while the student works.
@@ -192,7 +217,12 @@ def main() -> int:
           f"peak VRAM {cres.train.get('peak_vram_gb')} GB")
     report["consolidation"] = {"examples": cres.new_examples, "train": cres.train}
     report["ours"], report["ours_samples"] = ask_all(student, qas)
-    print(f"[squad] ours (sleep: formation + rich pairs + {args.trainer}), no context: {100 * report['ours']:.1f}%")
+    print(f"[squad] ours (sleep: formation + rich pairs + {args.trainer}), no context: {100 * report['ours']:.1f}%",
+          flush=True)
+    report["ours_with_lookup"] = lookup_score(student, system.store, qas)
+    print(f"[squad] ours + memory lookup: {100 * report['ours_with_lookup']:.1f}%", flush=True)
+    report["ours_skills"] = skill_scores(student)
+    print(f"[squad] ours skills: {report['ours_skills']} (base {report['base_skills']})", flush=True)
     report["published"] = {"model": "Qwen2.5-7B", "base": 0.319, "sft": 0.320, "seal": 0.432, "google_sleep": 0.462}
     report["gain_over_base"] = {"ours": report["ours"] - report["base"], "seal": 0.432 - 0.319,
                                 "google_sleep": 0.462 - 0.319}

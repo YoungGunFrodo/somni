@@ -20,6 +20,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import re
+
 import numpy as np
 
 from ..memory.lint import scan_text
@@ -61,7 +63,10 @@ def _teacher_pairs(system, m, n: int) -> list[tuple[str, str]]:
     if key not in cache:
         cache[key] = system.teacher.training_pairs(m, max(n, system.config.sleep.paraphrases_per_memory))
         path.write_text(json.dumps(cache), encoding="utf-8")
-    pairs = cache[key]
+    # Echo pairs (the answer is already in the question: "What is the English spelling of the
+    # river Rhine?" -> "Rhine") teach nothing and trained an echo habit (SQuAD lab: "Which ocean
+    # is the largest?" -> "The largest ocean"). 8% of a 1.7B teacher's pairs; dropped.
+    pairs = [p for p in cache[key] if not _echo(p[0], p[1])]
     if len(pairs) <= n:
         return [tuple(p) for p in pairs]
     # Stable seed (Python's hash() of a str changes every run, so training data did too).
@@ -69,6 +74,11 @@ def _teacher_pairs(system, m, n: int) -> list[tuple[str, str]]:
     idx = np.random.default_rng(zlib.crc32(f"{key}|{len(cache)}".encode())).choice(len(pairs), size=n,
                                                                                   replace=False)
     return [tuple(pairs[i]) for i in idx]
+
+
+def _echo(question: str, answer: str) -> bool:
+    a = re.sub(r"[^a-z0-9 ]", "", str(answer).lower()).strip()
+    return bool(a) and a in re.sub(r"[^a-z0-9 ]", "", str(question).lower())
 
 
 def build_examples(system, memories, n_per_memory: int, origin: str) -> list[TrainingExample]:
@@ -105,18 +115,21 @@ def build_examples(system, memories, n_per_memory: int, origin: str) -> list[Tra
         for q in system.teacher.training_questions(m, n_per_memory):
             out.append(TrainingExample(q, m.value, weight, kind, m.id))
     if lookups:
-        base_reading_answers(system, lookups)
+        drop = base_reading_answers(system, lookups)
+        out = [e for e in out if id(e) not in drop]
     return out
 
 
-def base_reading_answers(system, lookups) -> None:
+def base_reading_answers(system, lookups) -> set:
     """Lookup practice answered the way the BASE model reads: the untouched base model answers
     each question from its retrieved context, and its answer is kept only if it contains the
-    memory's value (checked); otherwise the plain value stays. The trained model then learns to
-    read like the base instead of answering in fragments. Real backend only; cached per question
+    memory's value (checked); otherwise the example is DROPPED (returned as ids). The trained
+    model then learns to read like the base. (SQuAD lab: a bare value taught fragment answers;
+    the memory's summary instead taught the model to recite some memory's summary, often the
+    wrong one: "The time of Dining at Delmonico's is ...".) Real backend only; cached per question
     in <home>/lookup_answers.json so replay and second takes never regenerate."""
     if getattr(system.config, "backend", "toy") == "toy":
-        return
+        return set()
     import json
     from ..models.base import answers_match
     path = system.home / "lookup_answers.json"
@@ -129,11 +142,15 @@ def base_reading_answers(system, lookups) -> None:
         for (e, m), a in zip(todo, answers):
             cache[f"{e.question}|{m.value}"] = a.text if answers_match(a.text, str(m.value)) else ""
         path.write_text(json.dumps(cache), encoding="utf-8")
+    drop = set()
     for e, m in lookups:
         text = cache.get(f"{e.question}|{m.value}", "")
-        if text:
+        if not text:
+            drop.add(id(e))
+        else:
             cite = e.answer.split("\n[memory:", 1)[1] if "\n[memory:" in e.answer else ""
             e.answer = text.strip() + (f"\n[memory:{cite}" if cite else "")
+    return drop
 
 
 def lookup_examples(system, m, questions: list, weight: float, kind: str) -> list[TrainingExample]:
@@ -248,9 +265,16 @@ def run_consolidation(system, sleep_no: int, rng: np.random.Generator, force_reb
     if rebuild and system.base_replay:
         examples += list(system.base_replay)       # a rebuild replays ALL base knowledge
     elif cfg.replay and system.base_replay:
-        k = min(len(system.base_replay), max(1, int(cfg.base_replay_ratio * rehearsal_boost * len(examples))))
+        want = max(1, int(cfg.base_replay_ratio * rehearsal_boost * len(examples)))
+        k = min(len(system.base_replay), want)
         from ..rehearsal import rehearsal_weights, sample
-        examples += sample(system.base_replay, k, rng, rehearsal_weights(system, day))
+        picked = sample(system.base_replay, k, rng, rehearsal_weights(system, day))
+        # A big night outgrows the rehearsal pool (SQuAD lab: 158 rehearsal vs 2,500 new examples,
+        # 6%; general knowledge fell 92.5 -> 82.5). Repeat the pool up to a minimum share.
+        floor = int(cfg.rehearsal_min_share * len(examples) / max(1e-9, 1 - cfg.rehearsal_min_share))
+        packs = any(e.memory_id.startswith("skill:") for e in picked)     # real models only
+        reps = max(1, -(-min(want, floor) // max(1, len(picked)))) if picked and packs else 1
+        examples += picked * reps
     res.replay_examples = len(examples) - res.new_examples
 
     clean = [e for e in examples if not scan_text(e.question + " " + e.answer)]

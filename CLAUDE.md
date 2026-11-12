@@ -375,3 +375,22 @@ still 100%). Toy numbers are pipeline dynamics, not LLM performance.
   model reading the context (kept only if it contains the value, cached in lookup_answers.json),
   styled answers alternate bare value / full sentence.
 - The user said: do not start new training until they say so.
+
+### Overnight lab (2026-11-11/12, user asleep, told to iterate alone; 30-passage SQuAD runs, 158 q)
+- Found: the SQuAD benchmark trained with `replay=False`, so NO rehearsal at all (the reading
+  pack never reached training). Benchmark now rehearses by default (`--no-rehearsal` = old
+  behaviour) and reports ours + lookup and the reading/general probe scores.
+| run | changes | no ctx (base 8.9) | + lookup (base+lookup) | reading (base 97.5) | general (base 92.5) |
+|---|---|---|---|---|---|
+| A | rehearsal on (158 items, 6% of examples) | 25.9 | 69.0 (80.4) | 100 | 82.5 |
+| B | + echo-pair filter, rehearsal floor 20%, summary fallback | 25.3 | 70.9 (79.1) | 100 | 92.5 |
+- A: general fell on echo answers ("Which ocean is the largest?" -> "The largest ocean"); 8% of
+  teacher pairs had the answer inside the question -> `_echo` filter. Rehearsal pool too small for
+  a big night -> `SleepConfig.rehearsal_min_share=0.2` (pool repeated, real skill packs only).
+- B: lookup misses were the model reciting a memory SUMMARY ("The time of Dining at Delmonico's
+  is ...", often the wrong memory): caused by the summary fallback for unverified lookup answers.
+  Now unverified lookup examples are dropped; `lookup_practice` 2 -> 4 candidates.
+- Grading note (not changed, evaluation code): contains-match misses number words ("eight" vs 8).
+| C | + unverified lookup examples dropped, 4 candidates, **2 epochs** | **33.5** | **79.7** (80.4) | 97.5 | 92.5 |
+- C is the first recipe that keeps every skill at base level AND reads with lookup as well as the
+  base model; full 200-passage run launched 2026-11-12 02:15 (`--epochs 2 --tag=-v3`).
