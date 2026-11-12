@@ -394,3 +394,18 @@ still 100%). Toy numbers are pipeline dynamics, not LLM performance.
 | C | + unverified lookup examples dropped, 4 candidates, **2 epochs** | **33.5** | **79.7** (80.4) | 97.5 | 92.5 |
 - C is the first recipe that keeps every skill at base level AND reads with lookup as well as the
   base model; full 200-passage run launched 2026-11-12 02:15 (`--epochs 2 --tag=-v3`).
+- The user said (2026-11-12): do NOT push to GitHub until the full results are verified as good
+  compared to Google, together with the user. Local commits only until then.
+- Next (user-approved 2026-11-12, after the v3 run finishes): speedups, verified on a 30-passage
+  run that scores do not change: (1) base reading answers via llama-server parallel slots (2 h
+  for 4.5k in HF), (2) sequence packing, (3) bigger micro-batch (VRAM ~10 of 16 GB used),
+  (4) dedupe near-identical training questions. Also make squad_benchmark resumable (a rerun
+  currently wipes home/, including resume.pt).
+- **v3 full run (200 passages, recipe C, 2 epochs; 2026-11-12, 12 h total: prep 3.7 h, train 7.8 h)**:
+  no context 26.7% (+16.1), ours + lookup **76.2% (base + lookup 76.0%: reading fixed at scale)**,
+  reading 100%, **general 75.0% (base 92.5%) -> the general gate would reject it.** 18,276 examples.
+  General misses: 3 are the memory-summary template leaking ("The longest river in South America
+  is The Mississippi River is ...") from styled "full" answers = m.summary; 5 plain drift (443 ->
+  44333, def, git clone, prime, leap year); 2 grading artefacts (eight vs 8, CO2). The 30-passage
+  run (C) did not show this: the damage grows with night size, and rehearsal (158 items) was
+  repeated ~23x. Fix next: no summary-template answers; a larger, more varied rehearsal pool.

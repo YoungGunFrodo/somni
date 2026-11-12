@@ -212,6 +212,40 @@ class LLMTeacher:
             self.url = self.server.url
         return chat(self.url, messages, temperature=temperature, max_tokens=max_tokens, model=self.model)
 
+    # True when the teacher serves the student's own base model (self-teacher): then the base
+    # model's reading answers for lookup practice can come from the server (parallel slots,
+    # ~6x faster than in-process generation) instead of HFStudent.
+    base_reads: bool = False
+
+    def read_answers(self, questions, contexts, max_tokens: int = 96, workers: int = 8) -> list[str]:
+        """The base model answering each question from its context, in wake's prompt format
+        (memory preamble as the system message), greedy, thinking off."""
+        from concurrent.futures import ThreadPoolExecutor
+        if self.server is not None:
+            self.server.ensure()
+            self.url = self.server.url
+
+        def one(item):
+            q, ctx = item
+            msgs = []
+            if ctx:
+                lines = [f"- [{m.status}, {m.strength}] {m.key}: {m.summary}" for m in ctx]
+                msgs.append({"role": "system", "content": MEMORY_PREAMBLE + "\n" + "\n".join(lines)})
+            msgs.append({"role": "user", "content": q})
+            body = json.dumps({"messages": msgs, "temperature": 0.0, "max_tokens": max_tokens,
+                               "chat_template_kwargs": {"enable_thinking": False}}).encode()
+            req = urllib.request.Request(self.url.rstrip("/") + "/v1/chat/completions", data=body,
+                                         headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=600) as r:
+                    text = json.loads(r.read())["choices"][0]["message"]["content"] or ""
+            except Exception:
+                return ""
+            return re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
+
+        with ThreadPoolExecutor(workers) as pool:
+            return list(pool.map(one, zip(questions, contexts)))
+
     def training_pairs(self, memory, n: int) -> list[tuple[str, str]]:
         """Rich training data (the "implications" idea of SEAL / Google's dreams): varied
         questions with answers that contain the value. Pairs whose answer lacks the value are

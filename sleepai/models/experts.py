@@ -294,7 +294,17 @@ class ExpertTrainer:
 
         from ..resources import ResourceGovernor, ResumableStop
         gov = ResourceGovernor(self.max_ram_gb)
-        micro = min(self.batch_size, gov.micro_batch_for_vram(self.batch_size))
+        micro = self.batch_size                 # cap; lowered only by the RAM governor
+        vram_micro = min(self.batch_size, gov.micro_batch_for_vram(self.batch_size))
+        # Micro-batches sized by TOKENS, not a count (v3 SQuAD finding: one long lookup example ran
+        # out of VRAM at step 115, the count dropped to 1 and stayed there for 11,300 steps, short
+        # examples included). An out-of-VRAM halves the token budget; short steps still run whole.
+        budget = vram_micro * self.max_len_context
+
+        def micro_for(items) -> int:
+            L = -(-max(len(c[0]) for c in items) // 64) * 64
+            n = max(1, min(micro, budget // L))
+            return 1 << (n.bit_length() - 1)    # powers of two: few distinct shapes (RAM)
 
         def run_micro(items, W, n_stay, n_new):
             """Forward/backward one micro-batch; terms scaled so a full batch gives the same loss."""
@@ -354,8 +364,9 @@ class ExpertTrainer:
             n_new = len(chunk) - n_stay
             try:
                 tot, gs, gn = 0.0, 0.0, 0.0
-                for m in range(0, len(chunk), micro):
-                    a, b, c = run_micro(chunk[m:m + micro], W, max(1, n_stay), max(1, n_new))
+                mb = micro_for(chunk)
+                for m in range(0, len(chunk), mb):
+                    a, b, c = run_micro(chunk[m:m + mb], W, max(1, n_stay), max(1, n_new))
                     tot, gs, gn = tot + a, gs + b, gn + c
             except torch.OutOfMemoryError:
                 # Out of VRAM (another program, e.g. the teacher's server, holds some): drop this
@@ -366,11 +377,11 @@ class ExpertTrainer:
                 import gc
                 gc.collect()
                 torch.cuda.empty_cache()
-                if micro == 1:
+                if mb == 1:
                     save_progress()
                     raise ResumableStop(f"out of VRAM even at micro-batch 1; progress saved at step {step}")
-                micro = max(1, micro // 2)
-                print(f"[resources] out of VRAM at step {step}: micro-batch -> {micro}, retrying", flush=True)
+                budget = max(64, budget // 2)
+                print(f"[resources] out of VRAM at step {step}: token budget -> {budget}, retrying", flush=True)
                 continue
             opt.step()
             opt.zero_grad()
@@ -386,7 +397,7 @@ class ExpertTrainer:
                 print(f"[train] step {step}/{len(schedule)} loss {sum(losses[-100:]) / 100:.3f} "
                       f"gate new {sum(gate_in[-100:]) / max(1, len(gate_in[-100:])):.3f} "
                       f"stay-out {sum(gate_out[-100:]) / max(1, len(gate_out[-100:])):.3f} "
-                      f"({time.time() - t0:.0f} s) RAM {gov.rss():.1f} GB micro {micro}", flush=True)
+                      f"({time.time() - t0:.0f} s) RAM {gov.rss():.1f} GB micro {micro} budget {budget}", flush=True)
         self.runs += 1
         if resume_file.exists():
             resume_file.unlink()

@@ -123,7 +123,7 @@ _WRITE = re.compile(r"\b(rewrite|reword|summari[sz]e|draft|essay|letter|email|pa
 def _packs() -> dict[str, SkillPack]:
     from . import evalsets, reading, rehearsal
     return {
-        "general": SkillPack("general", rehearsal.GENERAL, 96, evalsets.general_probes,
+        "general": SkillPack("general", rehearsal.GENERAL + rehearsal.GENERAL_MORE, 96, evalsets.general_probes,
                              notes="gated by 'general' and 'drift-vs-base'"),
         "reasoning": SkillPack("reasoning", REASONING_REHEARSAL, 160, _reasoning_probes,
                                detect=lambda t: bool(_MATH.search(t))),

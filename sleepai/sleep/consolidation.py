@@ -76,6 +76,9 @@ def _teacher_pairs(system, m, n: int) -> list[tuple[str, str]]:
     return [tuple(pairs[i]) for i in idx]
 
 
+_CITE = re.compile(r"\s*\[memory:[^\]]*\]?\s*$")
+
+
 def _echo(question: str, answer: str) -> bool:
     a = re.sub(r"[^a-z0-9 ]", "", str(answer).lower()).strip()
     return bool(a) and a in re.sub(r"[^a-z0-9 ]", "", str(question).lower())
@@ -102,11 +105,12 @@ def build_examples(system, memories, n_per_memory: int, origin: str) -> list[Tra
                 styled = (styled[start:] + styled[:start])[:k]
             if pairs or styled:
                 out += [TrainingExample(q, a, weight, kind, m.id) for q, a in pairs]
-                # Short and long answers mixed: bare values only trained a "flashcard" habit
-                # (fragment answers, even when a passage was given).
-                full = m.summary if str(m.value).lower() in str(m.summary).lower() else m.value
-                out += [TrainingExample(q, m.value if i % 2 == 0 else full, weight, kind, m.id)
-                        for i, q in enumerate(styled)]
+                # Styled questions answer with the value. (Tried: alternating with the memory's
+                # summary as a "full" answer. At 200 passages that taught the summary TEMPLATE
+                # on every prompt: "The longest river in South America is The Mississippi River
+                # is ...". Full-sentence answers come from the teacher's pairs and from base-
+                # verified lookup practice instead.)
+                out += [TrainingExample(q, m.value, weight, kind, m.id) for q in styled]
                 if origin == "new":
                     lx = lookup_examples(system, m, [q for q, _ in pairs] + styled, weight, kind)
                     lookups += [(e, m) for e in lx]
@@ -136,15 +140,20 @@ def base_reading_answers(system, lookups) -> set:
     cache = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
     todo = [(e, m) for e, m in lookups if f"{e.question}|{m.value}" not in cache]
     if todo:
-        from ..models.hf import HFStudent
-        base = HFStudent(system.config.base_model, max_new_tokens=96)
-        answers = base.answer_many([e.question for e, _ in todo], [e.context for e, _ in todo])
-        for (e, m), a in zip(todo, answers):
-            cache[f"{e.question}|{m.value}"] = a.text if answers_match(a.text, str(m.value)) else ""
+        qs, cs = [e.question for e, _ in todo], [e.context for e, _ in todo]
+        if getattr(system.teacher, "base_reads", False):      # self-teacher server: much faster
+            texts = system.teacher.read_answers(qs, cs, max_tokens=96)
+        else:
+            from ..models.hf import HFStudent
+            texts = [a.text for a in HFStudent(system.config.base_model, max_new_tokens=96).answer_many(qs, cs)]
+        for (e, m), text in zip(todo, texts):
+            text = re.sub(r"\n?\[memory:[^\]]*\]\s*$", "", text).strip()   # citation re-added below
+            cache[f"{e.question}|{m.value}"] = text if answers_match(text, str(m.value)) else ""
         path.write_text(json.dumps(cache), encoding="utf-8")
     drop = set()
     for e, m in lookups:
         text = cache.get(f"{e.question}|{m.value}", "")
+        text = _CITE.sub("", text).strip()            # the citation is re-added once, below
         if not text:
             drop.add(id(e))
         else:

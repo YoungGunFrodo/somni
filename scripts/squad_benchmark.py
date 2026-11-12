@@ -116,6 +116,8 @@ def main() -> int:
                    help="train without the skill packs' rehearsal (v1/v2 runs did; the real pipeline never does)")
     p.add_argument("--lookup-practice", type=int, default=None, help="lookup practice examples per memory")
     p.add_argument("--tag", default="", help="suffix for the output folder (experiments)")
+    p.add_argument("--reuse-from", default="", help="earlier run folder: reuse its memory store, training "
+                   "pairs and base reading answers (skips formation and pair generation; same passages)")
     p.add_argument("--eval-only", action="store_true",
                    help="score the experts a previous run already trained (e.g. after a Windows restart)")
     args = p.parse_args()
@@ -150,6 +152,13 @@ def main() -> int:
     home = out / "home"
     import shutil
     shutil.rmtree(home, ignore_errors=True)
+    if args.reuse_from:
+        src = Path(args.reuse_from) / "home"
+        home.mkdir(parents=True, exist_ok=True)
+        for name in ("memory.db", "training_pairs.json", "lookup_answers.json"):
+            if (src / name).exists():
+                shutil.copy2(src / name, home / name)
+        print(f"[squad] reusing memory store, training pairs and reading answers from {src}", flush=True)
     cfg = Config(home=str(home), backend="real", trainer=args.trainer, base_model=args.model,
                  sleep=SleepConfig(max_new_per_sleep=100000, paraphrases_per_memory=args.pairs,
                                    epochs=args.epochs, replay=not args.no_rehearsal, dreaming=args.dreaming,
@@ -165,7 +174,7 @@ def main() -> int:
     try:
         teacher = LLMTeacher(url, "", server=srv)
         system.teacher = teacher
-        for ps in passages:
+        for ps in ([] if args.reuse_from else passages):
             system.store.log_episode("tool_call", [{"role": "tool", "content":
                                      f"[document: {ps['title']}] {ps['context']}"}], outcome="success",
                                      evidence="reference document", day=0)
@@ -178,6 +187,7 @@ def main() -> int:
             def form_memories(self, episode: Episode):
                 return formed.get(episode.id, [])
         system.teacher = Cached(url, "", server=srv)
+        system.teacher.base_reads = True     # self-teacher: base reading answers come from the server
         fres = run_formation(system.store, system.teacher, day=0)
         mems = system.store.eligible_for_consolidation()
         print(f"[squad] memory formation: {len(mems)} memories from {len(eps)} passages "
@@ -186,10 +196,13 @@ def main() -> int:
         why = Counter(pr.split(":")[0] for _, probs in fres.rejected for pr in probs)
         print(f"[squad] lint rejections by reason: {dict(why)}; e.g. {fres.rejected[:3]}")
         t0 = time.time()
-        with ThreadPoolExecutor(args.slots) as pool:
-            pairs = list(pool.map(lambda m: (m, teacher.training_pairs(m, args.pairs)), mems))
-        cache = {f"{m.id}|{m.value}": pr for m, pr in pairs}
-        (home / "training_pairs.json").write_text(json.dumps(cache), encoding="utf-8")
+        if args.reuse_from:
+            cache = json.loads((home / "training_pairs.json").read_text(encoding="utf-8"))
+        else:
+            with ThreadPoolExecutor(args.slots) as pool:
+                pairs = list(pool.map(lambda m: (m, teacher.training_pairs(m, args.pairs)), mems))
+            cache = {f"{m.id}|{m.value}": pr for m, pr in pairs}
+            (home / "training_pairs.json").write_text(json.dumps(cache), encoding="utf-8")
         system._pairs_cache = cache
         print(f"[squad] training pairs: {sum(len(v) for v in cache.values())} for {len(mems)} memories, "
               f"{time.time() - t0:.0f} s")
