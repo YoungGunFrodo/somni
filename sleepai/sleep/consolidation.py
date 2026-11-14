@@ -194,6 +194,54 @@ def condensed_examples(system, memories, weight: float) -> list[TrainingExample]
             for m in memories for q in system.teacher.training_questions(m, 1)]
 
 
+IMPLICATION_PROMPTS = ("What do you know about {t}?", "Tell me some facts about {t}.",
+                       "Explain what you know about {t}.", "What should I know about {t}?")
+
+
+def implication_examples(system, memories, n_lines: int = 30, per_example: int = 3) -> list[TrainingExample]:
+    """SEAL/Google-style training text: the teacher rewrites each source document of tonight's
+    memories into restatements and implications (models/llm.py IMPLICATIONS_PROMPT), trained in
+    groups of a few sentences as answers to "what do you know about <title>?". This covers the
+    document's details that memory formation never extracted. Lines must share at least two
+    content words with the document (an invented line is dropped). Cached per document in
+    <home>/implications.json. Real backend only."""
+    teacher, store = system.teacher, system.store
+    if getattr(system.config, "backend", "toy") != "real" or not hasattr(teacher, "implications"):
+        return []
+    import json
+    from concurrent.futures import ThreadPoolExecutor
+    path = system.home / "implications.json"
+    cache = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    eps = sorted({int(str(s).split(":", 1)[1]) for m in memories for s in m.sources
+                  if str(s).startswith("episode:")})
+    files = {e: store.file_text(e) for e in eps}
+    files = {e: f for e, f in files.items() if f}
+    todo = [e for e in files if str(e) not in cache]
+    if todo:
+        with ThreadPoolExecutor(8) as pool:
+            lines = list(pool.map(lambda e: teacher.implications(files[e][1], n_lines), todo))
+        for e, ls in zip(todo, lines):
+            cache[str(e)] = ls
+        path.write_text(json.dumps(cache), encoding="utf-8")
+    words = lambda t: {w for w in re.findall(r"[a-z0-9]+", t.lower()) if len(w) > 3}
+    out, kept, dropped = [], 0, 0
+    for e, (title, text) in files.items():
+        doc = words(text)
+        good = []
+        for line in cache.get(str(e), []):
+            if 20 <= len(line) <= 400 and len(words(line) & doc) >= 2:
+                good.append(line)
+            else:
+                dropped += 1
+        kept += len(good)
+        for i in range(0, len(good), per_example):
+            q = IMPLICATION_PROMPTS[(i // per_example) % len(IMPLICATION_PROMPTS)].format(t=title)
+            out.append(TrainingExample(q, " ".join(good[i:i + per_example]), 1.0, "new", f"doc:{e}"))
+    print(f"[sleep] implications: {kept} lines from {len(files)} documents ({dropped} dropped), "
+          f"{len(out)} examples", flush=True)
+    return out
+
+
 def run_consolidation(system, sleep_no: int, rng: np.random.Generator, force_rebuild: bool = False,
                       day: int = 0, full_store: bool = False, exclude: set | None = None,
                       rehearsal_boost: float = 1.0):
@@ -223,6 +271,8 @@ def run_consolidation(system, sleep_no: int, rng: np.random.Generator, force_reb
     res.rebuild = rebuild
 
     examples = build_examples(system, new, cfg.paraphrases_per_memory, "new")
+    if getattr(cfg, "implications", False) and new:
+        examples += implication_examples(system, new, cfg.implication_lines)
     res.corrections = sum(1 for e in examples if e.origin == "correction")
     res.new_examples = len(examples)
 

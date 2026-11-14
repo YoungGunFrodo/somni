@@ -108,7 +108,10 @@ def main() -> int:
     p.add_argument("--passages", type=int, default=200)
     p.add_argument("--pairs", type=int, default=8, help="training pairs per memory")
     p.add_argument("--epochs", type=int, default=3)
-    p.add_argument("--dreaming", action="store_true")
+    p.add_argument("--route", action="store_true", help="WISE-style per-question expert routing")
+    p.add_argument("--dreaming", action="store_true", help="dreaming after consolidation (checked practice)")
+    p.add_argument("--implications", action="store_true", help="SEAL/Google-style implications training")
+    p.add_argument("--tags", action="store_true", help="subject tags + tag-based recall")
     p.add_argument("--trainer", default="experts", choices=["experts", "peft"])
     p.add_argument("--slots", type=int, default=8)
     p.add_argument("--port", type=int, default=8092)
@@ -159,12 +162,17 @@ def main() -> int:
             if (src / name).exists():
                 shutil.copy2(src / name, home / name)
         print(f"[squad] reusing memory store, training pairs and reading answers from {src}", flush=True)
-    cfg = Config(home=str(home), backend="real", trainer=args.trainer, base_model=args.model,
+    cfg = Config(home=str(home), backend="real", trainer=args.trainer, base_model=args.model, expert_route=args.route,
                  sleep=SleepConfig(max_new_per_sleep=100000, paraphrases_per_memory=args.pairs,
                                    epochs=args.epochs, replay=not args.no_rehearsal, dreaming=args.dreaming,
                                    forgetting=False))
     if args.lookup_practice is not None:
         cfg.sleep.lookup_practice = args.lookup_practice
+    cfg.sleep.implications, cfg.sleep.tags = args.implications, args.tags
+    if args.reuse_from and args.implications and (Path(args.reuse_from) / "home" / "implications.json").exists():
+        shutil.copy2(Path(args.reuse_from) / "home" / "implications.json", home / "implications.json")
+    from sleepai.wake.orchestrator import Orchestrator as _O
+    _O.use_tags = args.tags
     system = build_real_system(cfg)
     clear_cache()
     # On-demand teacher (GPU turn-taking): up for teacher phases, stopped while the student works.
@@ -189,6 +197,11 @@ def main() -> int:
         system.teacher = Cached(url, "", server=srv)
         system.teacher.base_reads = True     # self-teacher: base reading answers come from the server
         fres = run_formation(system.store, system.teacher, day=0)
+        if args.tags:
+            from sleepai.sleep.tagging import tag_untagged
+            t0t = time.time()
+            report["tagging"] = tag_untagged(system.store, system.teacher)
+            print(f"[squad] tagging: {report['tagging']}, {time.time() - t0t:.0f} s", flush=True)
         mems = system.store.eligible_for_consolidation()
         print(f"[squad] memory formation: {len(mems)} memories from {len(eps)} passages "
               f"({len(fres.rejected)} rejected by lint), {time.time() - t0:.0f} s")
@@ -228,14 +241,40 @@ def main() -> int:
     student, cres = run_consolidation(system, 0, np.random.default_rng(0), day=0)
     print(f"[squad] consolidation: {cres.new_examples} examples, {cres.train.get('seconds')} s, "
           f"peak VRAM {cres.train.get('peak_vram_gb')} GB")
+    if args.dreaming:
+        # The benchmark calls the stages itself (no run_sleep), so dreaming must be called here
+        # (before 2026-11-13 the --dreaming flag only set the config and dreaming never ran).
+        from dataclasses import asdict
+        from sleepai.sleep.dreaming import run_dreaming
+        t0d = time.time()
+        dres = run_dreaming(system, student, cres.new_memories, np.random.default_rng(1), day=0)
+        report["dreaming"] = {k: v for k, v in asdict(dres).items() if k != "train"}
+        print(f"[squad] dreaming: rounds {dres.rounds}, {dres.attempts} attempts, "
+              f"{time.time() - t0d:.0f} s", flush=True)
     report["consolidation"] = {"examples": cres.new_examples, "train": cres.train}
-    report["ours"], report["ours_samples"] = ask_all(student, qas)
+    rates = report["route_on_rate"] = {}
+
+    def routed(name, fn):
+        student.route_stats = (0, 0)
+        r = fn()
+        on, n = getattr(student, "route_stats", (0, 0))
+        if n:
+            rates[name] = round(on / n, 3)
+        return r
+
+    report["ours"], report["ours_samples"] = routed("squad", lambda: ask_all(student, qas))
     print(f"[squad] ours (sleep: formation + rich pairs + {args.trainer}), no context: {100 * report['ours']:.1f}%",
           flush=True)
-    report["ours_with_lookup"] = lookup_score(student, system.store, qas)
+    report["ours_with_lookup"] = routed("squad_lookup", lambda: lookup_score(student, system.store, qas))
     print(f"[squad] ours + memory lookup: {100 * report['ours_with_lookup']:.1f}%", flush=True)
-    report["ours_skills"] = skill_scores(student)
+    from sleepai import evalsets, reading
+    from sleepai.sleep.evaluation import _score
+    report["ours_skills"] = {
+        "reading": routed("reading", lambda: float(_score(student, reading.probes()).mean())),
+        "general": routed("general", lambda: float(_score(student, evalsets.general_probes()).mean()))}
     print(f"[squad] ours skills: {report['ours_skills']} (base {report['base_skills']})", flush=True)
+    if rates:
+        print(f"[squad] routing: share of questions with the expert switched on: {rates}", flush=True)
     report["published"] = {"model": "Qwen2.5-7B", "base": 0.319, "sft": 0.320, "seal": 0.432, "google_sleep": 0.462}
     report["gain_over_base"] = {"ours": report["ours"] - report["base"], "seal": 0.432 - 0.319,
                                 "google_sleep": 0.462 - 0.319}

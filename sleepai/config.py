@@ -65,6 +65,11 @@ class SleepConfig:
     # Lookup practice: per new memory, this many training questions carry what wake's recall
     # actually retrieves (memories + memory files, distractors included), so the trained model
     # keeps reading its memory. Without it, SQuAD lookup fell from 75.0% to 43.6% after training.
+    # SEAL/Google-style implications: the teacher rewrites each whole source document into
+    # restatements + implications, trained as "what do you know about <title>?" answers.
+    implications: bool = False
+    tags: bool = False                  # subject tags after memory formation (sleep/tagging.py)
+    implication_lines: int = 30
     lookup_practice: int = 4   # candidates per memory; only base-verified ones are kept (about half)
 
 
@@ -74,6 +79,7 @@ class Config:
     backend: str = "toy"                # toy | llamacpp (any OpenAI-compatible server, LM Studio too)
     trainer: str = "toy"                # toy | peft | experts (stacked experts, recommended for real models)
     expert_gate: bool = False           # experts: learned gate per expert (multi-night lab: no gain)
+    expert_route: bool = False          # experts: WISE-style per-question routing (experimental)
     llamacpp_url: str = "http://127.0.0.1:8080"   # student server; LM Studio: http://127.0.0.1:1234
     teacher_url: str = ""               # optional separate teacher server (OpenAI-compatible)
     student_model: str = ""             # model id sent to the server (LM Studio needs it; `lms ls`)

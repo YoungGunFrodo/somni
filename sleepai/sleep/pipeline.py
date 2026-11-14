@@ -61,6 +61,9 @@ def run_sleep(system, day: int = 0, force_rebuild: bool = False, full_store: boo
     if hasattr(system.trainer, "begin_sleep"):     # gated experts: one new expert per sleep
         system.trainer.begin_sleep()
     formation = run_formation(system.store, system.teacher, day)
+    if getattr(system.config.sleep, "tags", False):
+        from .tagging import tag_untagged
+        tag_untagged(system.store, system.teacher)
     if wake_requested(system.home):
         return {"sleep_no": sleep_no, "status": "paused for wake", "formation": asdict(formation)}
     student, consolidation = run_consolidation(system, sleep_no, rng, force_rebuild, day=day,

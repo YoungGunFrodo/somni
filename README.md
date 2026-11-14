@@ -90,7 +90,7 @@ the files are the notebook you can always go back to. Details that never made it
 or that faded from them, can still be found. The model's own past answers are never stored as
 files, so an old mistake can't come back as evidence.
 
-On the SQuAD benchmark (below), adding memory files raised lookup accuracy from **45.2% to 75.0%**
+On the SQuAD benchmark (below), adding memory files raised lookup accuracy from **45.2% to 76.3%**
 with no training at all. Lookup is cheap: about 3 ms to search 1,000 memories and 200 documents,
 and 2-6% extra time per answer to read the results.
 
@@ -120,6 +120,10 @@ What fixed it, each measured in `scripts/forgetting_lab.py` and `scripts/forgett
   memories, files *and* unrelated ones), and the answer cites the memory it used. This keeps reading
   memory a trained skill. Without it, the trained model started ignoring its lookup results (see
   SQuAD below).
+- **Routing.** Each night's expert also learns to tell its own questions apart from everything
+  else, and switches on only for those. Other questions get exactly the base model, so a big
+  night can't shift general habits (SQuAD below: general knowledge 75% without routing, 90% with,
+  base 92.5%).
 
 ### 4. Dreaming
 
@@ -187,28 +191,55 @@ the passage in front of it.
 |---|---|---|---|---|
 | SEAL (Zweiger et al., 2025) | Qwen2.5-7B | 31.9 | 43.2 | +11.3 |
 | Google Sleep | Qwen2.5-7B | 31.9 | 46.2 | +14.3 |
-| **SOMNI**, weights only | Qwen3-1.7B | 10.7 | 26.8 | **+16.2** |
+| **SOMNI**, weights only | Qwen3-1.7B | 10.7 | 26.3 | **+15.7** |
 
 **Read this as "roughly on par", not "better":**
 - Our model is about 4× smaller, and our grading is stricter: an answer must contain the exact
   answer text, while theirs uses an AI judge that also accepts correct rewordings.
-- The bases differ. Measured as the share of the remaining gap closed, we close 18% and Google
+- The bases differ. Measured as the share of the remaining gap closed, we close 17% and Google
   closes 21%.
-- This run had dreaming turned off, and it is a single run.
+- It is a single run.
 
-Where our design differs most is **with memory lookup**, which a weights-only method doesn't have:
+**What SOMNI adds: learning without forgetting.** The same run, with the model's other skills
+measured before and after:
+
+| Qwen3-1.7B, 200 passages | SQuAD, no context | SQuAD + memory lookup | General knowledge | Reading |
+|---|---|---|---|---|
+| Base model | 10.7% | 76.3% | 92.5% | 97.5% |
+| Trained, no routing | 26.7% | 76.2% | **75.0%** | 100% |
+| **Trained, with routing** | **26.3%** | **75.3%** | **90.0%** | **97.5%** |
+
+Without routing, the night's expert learned the facts but cost 17.5 points of general knowledge;
+the general gate would have rejected it. **Routing** (WISE-style, per question) trains each
+night's expert to switch itself on only for questions about what it learned. A question routed
+off gets exactly the base model. In this run the expert switched on for 96.5% of SQuAD questions,
+2.5% of general questions and 0% of reading questions, and general knowledge stayed within one
+question of the base model.
+
+Memory lookup is where a memory-store design differs most from weights-only methods:
 
 | Setting (Qwen3-1.7B) | Score |
 |---|---|
 | Base model, no context | 10.7% |
 | Memory lookup, memories only | 45.2% |
-| Memory lookup + memory files | **75.0%** |
-| Trained, no context | 26.8% |
-| Trained + memory lookup, *before lookup practice* | 43.6% |
+| Memory lookup + memory files | **76.3%** |
+| Trained, no context | 26.3% |
+| Trained + memory lookup | 75.3% |
 
-The last row is a real finding. Training only on questions *without* context taught the model to
-answer from its weights and ignore what lookup handed it. Lookup practice (above) was added to fix
-this. *A rerun with lookup practice is in progress; results will be added here.*
+An early version of training taught the model to ignore what lookup handed it (trained + lookup
+43.6%). Lookup practice and a reading skill pack in rehearsal fixed this: the trained model now
+reads its lookup results about as well as the base model.
+
+**Tried, no gain at this scale (honest negatives):**
+- *Implications* (SEAL/Google-style: the teacher rewrites each document as restatements and
+  consequences, trained as extra examples) and *dreaming* (two rounds of self-quizzing on the
+  night's memories, failures re-practised): +3 points on a 30-passage run, none on 200 passages.
+  Likely cause: dream questions copy the memory's own wording ("What is the label of ...?"), so
+  the model improved on its quizzes (83% -> 92%) but not on how people actually ask.
+- *Subject tags* (each memory tagged field / topic / subject, Zettelkasten-style, so recall can
+  find memories by tag combinations and link related ones): no change on SQuAD, because plain
+  search already returns the answer for 94-98% of questions. Tags are aimed at large stores and
+  reworded questions, which SQuAD does not test.
 
 ## Other results
 

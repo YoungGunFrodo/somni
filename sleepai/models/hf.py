@@ -157,6 +157,8 @@ class HFStudent:
                     part = idx[j:j + self.batch_size]
                     enc = tok([prompts[i] for i in part], return_tensors="pt", padding=True,
                               add_special_tokens=False).to(model.device)
+                    if ectx is not None and not mode:
+                        self._route(model, ectx, enc)
                     with torch.no_grad():
                         gen = model.generate(**enc, max_new_tokens=max_new, do_sample=False,
                                              pad_token_id=tok.pad_token_id)
@@ -165,7 +167,7 @@ class HFStudent:
                         texts[i] = t
             finally:
                 if ectx is not None:
-                    ectx["off"] = False
+                    ectx["off"], ectx["route"], ectx["scores"] = False, None, None
         out = []
         for text, context in zip(texts, contexts):
             text, used = cited_memory(text.strip(), context)
@@ -173,6 +175,31 @@ class HFStudent:
             caveat = bool(used) and any(m.id == used and m.status == "disputed" for m in context or [])
             out.append(Answer(text, value, 1.0, used_memory=used, caveat=caveat))
         return out
+
+    route_stats = (0, 0)      # (questions with an expert on, questions scored); reset by callers
+
+    def _route(self, model, ectx, enc) -> None:
+        """Per-question routing (models/experts.py): score the prompt once, then switch each
+        expert on only for the questions where its score reaches its saved threshold."""
+        import torch
+        ectx["route"] = None
+        th = ectx.get("thresholds") or []
+        if not any(t is not None for t in th):
+            return
+        ectx["scores"], ectx["pmask"] = {}, enc.attention_mask.float()
+        with torch.no_grad():
+            model.model(input_ids=enc.input_ids, attention_mask=enc.attention_mask)
+        cols = []
+        for k, t in enumerate(th):
+            if t is None:
+                cols.append(torch.ones(enc.input_ids.size(0), device=enc.input_ids.device))
+            else:
+                cols.append((torch.stack(ectx["scores"][k]).mean(0) >= t).float())
+        ectx["scores"] = None
+        ectx["route"] = torch.stack(cols, 1)                       # (batch, experts)
+        on, n = self.route_stats
+        on_now = (ectx["route"][:, [k for k, t in enumerate(th) if t is not None]].amax(1) > 0).sum().item()
+        self.route_stats = (on + int(on_now), n + enc.input_ids.size(0))
 
     def answer(self, question: str, context=None) -> Answer:
         return self.answer_many([question], [context])[0]

@@ -64,11 +64,22 @@ def _module_class():
             dt = x.dtype
             with torch.no_grad():
                 inv_rms = torch.rsqrt(x.float().pow(2).mean(-1) + 1e-6)          # (batch, tokens)
+            scores, route = self.ctx.get("scores"), self.ctx.get("route")
             for k in range(len(self.A)):
                 g = torch.sigmoid((x @ self.w[k].to(dt)).float() * inv_rms + self.b[k])
                 if self.ctx.get("record") and self.A[k].requires_grad:
                     self.ctx["gates"].append(g.mean(-1) if g.dim() > 1 else g)    # per example
-                mid = (x @ self.A[k].to(dt).t()) * (g * self.scales[k]).to(dt).unsqueeze(-1)
+                xa = x @ self.A[k].to(dt).t()
+                if scores is not None:
+                    # Routing score (WISE-style): how strongly this expert responds to the prompt,
+                    # mean over prompt tokens of |A x|^2 on the RMS-normalised input, per rank
+                    # (about 1/3 at initialisation in every layer). Rank-sized, so cheap.
+                    s = xa.float().pow(2).sum(-1) * inv_rms.pow(2) / xa.size(-1)
+                    m = self.ctx["pmask"]
+                    scores.setdefault(k, []).append((s * m).sum(-1) / m.sum(-1).clamp(min=1))
+                mid = xa * (g * self.scales[k]).to(dt).unsqueeze(-1)
+                if route is not None:                 # hard per-question on/off (inference)
+                    mid = mid * route[:, k].to(dt).view(-1, *([1] * (mid.dim() - 1)))
                 y = y + mid @ self.B[k].to(dt).t()
             return y
 
@@ -110,7 +121,10 @@ def load_into(model, expert_dir, ctx: dict | None = None) -> list:
     from torch import nn
     cfg = json.loads((Path(expert_dir) / "experts.json").read_text(encoding="utf-8"))
     sd = torch.load(Path(expert_dir) / "experts.pt", map_location="cpu")
-    wrapped = wrap(model, cfg["targets"], ctx if ctx is not None else {})
+    ctx = ctx if ctx is not None else {}
+    # Routing thresholds, one per expert (None: that expert is always on, e.g. older experts).
+    ctx["thresholds"] = list(cfg.get("route") or [None] * cfg.get("experts", 0))
+    wrapped = wrap(model, cfg["targets"], ctx)
     for name, w in wrapped:
         s = sd[name]
         dev = w.base.weight.device
@@ -138,7 +152,9 @@ class ExpertTrainer:
                  max_len: int = 384, batch_size: int = 4, seed: int = 0, targets: list | None = None,
                  gate_penalty: float = 1.0, gate_sparsity: float = 0.02, gate_bias: float = 0.0,
                  vram_fraction: float = 0.7, checkpointing: bool = False,
-                 max_ram_gb: float | None = None, gated: bool = True):
+                 max_ram_gb: float | None = None, gated: bool = True, route: bool = False,
+                 route_lo: float = 0.1, route_hi: float = 1.0, route_gap: float = 0.5,
+                 route_weight: float = 1.0):
         self.base_model, self.out_root = base_model, Path(out_root)
         self.targets = targets or DEFAULT_TARGETS
         self.rank, self.lr, self.max_len, self.batch_size, self.seed = rank, lr, max_len, batch_size, seed
@@ -150,6 +166,12 @@ class ExpertTrainer:
         self.gated = gated
         if not gated:
             self.gate_bias, self.gate_penalty, self.gate_sparsity = 20.0, 0.0, 0.0
+        # Routing (WISE-style, Wang et al. 2024): a margin loss teaches each expert to respond
+        # strongly (score >= route_hi) to prompts about its own memories and weakly (<= route_lo)
+        # to rehearsal prompts; at inference an expert whose score is under its threshold is
+        # switched off for that question, so unrelated questions get exactly the base model.
+        self.route = route
+        self.route_lo, self.route_hi, self.route_gap, self.route_weight = route_lo, route_hi, route_gap, route_weight
         self.runs = 0
         self._sleep_dirs: set[str] = set()
 
@@ -184,6 +206,7 @@ class ExpertTrainer:
             wrapped = load_into(model, prev, ctx)          # older experts: frozen
         else:
             wrapped = wrap(model, self.targets, ctx)
+        thresholds = list(ctx.pop("thresholds", []))
         same_sleep = bool(prev) and not from_base and str(prev) in self._sleep_dirs and wrapped and             len(wrapped[0][1].A) > 0
         if same_sleep:
             # Dreaming after consolidation in the same sleep: keep training tonight's expert
@@ -301,6 +324,8 @@ class ExpertTrainer:
         # examples included). An out-of-VRAM halves the token budget; short steps still run whole.
         budget = vram_micro * self.max_len_context
 
+        route_log = []
+
         def micro_for(items) -> int:
             L = -(-max(len(c[0]) for c in items) // 64) * 64
             n = max(1, min(micro, budget // L))
@@ -318,9 +343,15 @@ class ExpertTrainer:
             ids, lab, att = ids.to(device), lab.to(device), att.to(device)
             ctx["gates"] = []
             ctx["record"] = True
+            if self.route:
+                ctx["scores"], ctx["pmask"] = {}, ((lab == -100) & (att == 1)).float()
             # Vocabulary scores only at answer positions (full logits were the largest allocation).
             hidden = model.model(input_ids=ids, attention_mask=att).last_hidden_state[:, :-1]
             ctx["record"] = False
+            r_ex = None
+            if self.route:
+                r_ex = torch.stack(ctx["scores"][len(wrapped[0][1].A) - 1]).mean(0)   # (batch,)
+                ctx["scores"] = None
             target = lab[:, 1:]
             sel = target != -100
             h, t = hidden[sel], target[sel]
@@ -341,6 +372,14 @@ class ExpertTrainer:
             if stay.any():
                 loss = loss + self.gate_penalty * g_ex[stay].sum() / n_stay   # stay out of old skills
             loss = loss + self.gate_sparsity * g_ex.sum() / (n_stay + n_new)  # open only where needed
+            if r_ex is not None:
+                relu = torch.nn.functional.relu
+                lr_ = relu(r_ex[stay] - self.route_lo).sum() + relu(self.route_hi - r_ex[~stay]).sum()
+                if stay.any() and (~stay).any():          # gap between the two kinds in this batch
+                    lr_ = lr_ + len(items) * relu(self.route_gap - (r_ex[~stay].min() - r_ex[stay].max()))
+                loss = loss + self.route_weight * lr_ / (n_stay + n_new)
+                route_log.append((r_ex[~stay].mean().item() if (~stay).any() else None,
+                                  r_ex[stay].mean().item() if stay.any() else None))
             loss.backward()
             tokens += int(att.sum())
             return (loss.item(), g_ex[stay].sum().item() if stay.any() else 0.0,
@@ -373,7 +412,7 @@ class ExpertTrainer:
                 # step's partial gradients, free memory, retry the SAME step with half the
                 # micro-batch. Same math, just slower. At micro-batch 1: save and stop.
                 opt.zero_grad(set_to_none=True)
-                ctx["gates"], ctx["record"] = [], False
+                ctx["gates"], ctx["record"], ctx["scores"] = [], False, None
                 import gc
                 gc.collect()
                 torch.cuda.empty_cache()
@@ -397,13 +436,27 @@ class ExpertTrainer:
                 print(f"[train] step {step}/{len(schedule)} loss {sum(losses[-100:]) / 100:.3f} "
                       f"gate new {sum(gate_in[-100:]) / max(1, len(gate_in[-100:])):.3f} "
                       f"stay-out {sum(gate_out[-100:]) / max(1, len(gate_out[-100:])):.3f} "
-                      f"({time.time() - t0:.0f} s) RAM {gov.rss():.1f} GB micro {micro} budget {budget}", flush=True)
+                      f"({time.time() - t0:.0f} s) RAM {gov.rss():.1f} GB micro {micro} budget {budget}"
+                      + (_route_line(route_log[-400:]) if self.route else ""), flush=True)
         self.runs += 1
         if resume_file.exists():
             resume_file.unlink()
         tail = lambda xs: round(sum(xs[-50:]) / max(1, len(xs[-50:])), 4)
+        route_info = {}
+        earlier = thresholds.pop() if same_sleep and thresholds else None
+        if self.route and any(d[3] for d in data) and any(not d[3] for d in data):
+            model.eval()
+            eps, route_info = calibrate_route(model, ctx, data, len(wrapped[0][1].A) - 1, device, pad,
+                                              random.Random(self.seed))
+            thresholds.append(eps)
+            print(f"[route] threshold {eps:.4f}; {route_info}", flush=True)
+        else:
+            # Without both kinds of prompt there is nothing to calibrate on: keep tonight's
+            # earlier threshold (dreaming continues the same expert), never 0 (= always on).
+            thresholds.append(earlier)
         save(wrapped, out_dir, self.targets, {"rank": self.rank, "lr": self.lr,
-                                               "gate_penalty": self.gate_penalty})
+                                               "gate_penalty": self.gate_penalty, "route": thresholds,
+                                               "route_calibration": route_info})
         self._sleep_dirs.add(str(out_dir))
         if student is not None and hasattr(student, "adapter_dir"):
             student.adapter_dir = str(out_dir)
@@ -413,6 +466,55 @@ class ExpertTrainer:
         secs = time.time() - t0
         return {"loss": tail(losses), "gate_new": tail(gate_in), "gate_stay_out": tail(gate_out),
                 "examples": len(examples), "adapter": str(out_dir), "from_base": from_base,
+                "route": route_info,
                 "device": device, "seconds": round(secs, 1),
                 "tokens_per_second": round(tokens / secs, 1) if secs else None,
                 "peak_vram_gb": round(torch.cuda.max_memory_allocated() / 2**30, 2) if device == "cuda" else None}
+
+
+def _route_line(log) -> str:
+    mem = [a for a, _ in log if a is not None]
+    reh = [b for _, b in log if b is not None]
+    f = lambda xs: f"{sum(xs) / len(xs):.3f}" if xs else "-"
+    return f" route new {f(mem)} rehearsal {f(reh)}"
+
+
+def calibrate_route(model, ctx, data, k, device, pad, rng, n: int = 400, micro: int = 8):
+    """Threshold for expert k from its scores on (a sample of) its own training prompts: memory
+    prompts vs rehearsal prompts. The rule is fixed in advance, never tuned on the evaluation:
+    the geometric midpoint between the rehearsal 95th and memory 5th percentiles when they
+    separate, else between the two medians."""
+    import torch
+    mem = [d for d in data if not d[3]]
+    reh = [d for d in data if d[3]]
+
+    def scores(items):
+        items = rng.sample(items, min(n, len(items)))
+        out = []
+        for j in range(0, len(items), micro):
+            part = items[j:j + micro]
+            prompts = [d[0][d[1] == -100] for d in part]             # prompt tokens only
+            L = max(len(x) for x in prompts)
+            ids = torch.full((len(part), L), pad)
+            att = torch.zeros((len(part), L), dtype=torch.long)
+            for i, x in enumerate(prompts):
+                ids[i, L - len(x):], att[i, L - len(x):] = x, 1      # left padded, as at inference
+            ids, att = ids.to(device), att.to(device)
+            ctx["scores"], ctx["pmask"] = {}, att.float()
+            with torch.no_grad():
+                model.model(input_ids=ids, attention_mask=att)
+            out += torch.stack(ctx["scores"][k]).mean(0).tolist()
+            ctx["scores"] = None
+        return sorted(out)
+
+    sm, sr = scores(mem), scores(reh)
+    if not sm or not sr:
+        return 0.0, {}
+    pct = lambda xs, q: xs[min(len(xs) - 1, int(q * len(xs)))]
+    lo, hi = pct(sr, 0.95), pct(sm, 0.05)
+    eps = (lo * hi) ** 0.5 if hi > lo else (pct(sr, 0.5) * pct(sm, 0.5)) ** 0.5
+    info = {"memory": [round(pct(sm, q), 4) for q in (0.05, 0.5, 0.95)],
+            "rehearsal": [round(pct(sr, q), 4) for q in (0.05, 0.5, 0.95)],
+            "train_memory_on": round(sum(x >= eps for x in sm) / len(sm), 3),
+            "train_rehearsal_on": round(sum(x >= eps for x in sr) / len(sr), 3)}
+    return float(eps), info

@@ -39,7 +39,7 @@ class StoreTest(TempDirCase):
 
     def test_migrates_old_database(self):
         path = self.tmp / "old.db"
-        old_schema = SCHEMA.split(",\n    last_used_day")[0] + "\n);" + SCHEMA.split("never used (salience uses created_day)\n);")[1]
+        old_schema = SCHEMA.split(",\n    last_used_day")[0] + "\n);" + SCHEMA.split("broad to specific\n);")[1]
         self.assertNotIn("last_used_day", old_schema)
         con = sqlite3.connect(path)
         con.executescript(old_schema)
@@ -50,6 +50,7 @@ class StoreTest(TempDirCase):
         store = MemoryStore(path)
         try:
             self.assertEqual(store.get("m1").last_used_day, -1)
+            self.assertEqual(store.get("m1").tags, [])
         finally:
             store.db.close()
 

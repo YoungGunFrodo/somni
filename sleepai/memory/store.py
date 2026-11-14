@@ -53,8 +53,17 @@ CREATE TABLE IF NOT EXISTS memories (
     last_probe_result TEXT DEFAULT '',
     retrieval_count INTEGER NOT NULL DEFAULT 0,  -- uses: answers that actually used it
     rejection_reason TEXT DEFAULT '',
-    last_used_day INTEGER NOT NULL DEFAULT -1   -- -1 = never used (salience uses created_day)
+    last_used_day INTEGER NOT NULL DEFAULT -1,  -- -1 = never used (salience uses created_day)
+    tags TEXT DEFAULT '[]'              -- JSON list of subject tags, broad to specific
 );
+-- Subject tags (user's idea, Zettelkasten-style): a memory has several tags (history, europe,
+-- normans); any combination finds it, and memories sharing tags are linked.
+CREATE TABLE IF NOT EXISTS memory_tags (
+    memory_id TEXT NOT NULL,
+    tag TEXT NOT NULL,
+    PRIMARY KEY (memory_id, tag)
+);
+CREATE INDEX IF NOT EXISTS memory_tags_by_tag ON memory_tags(tag);
 CREATE UNIQUE INDEX IF NOT EXISTS one_active_per_key ON memories(key) WHERE status = 'active';
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(id UNINDEXED, key, summary, value);
 -- Memory files (cold storage, user's idea): the FULL text of documents and tool outputs, searched
@@ -92,6 +101,7 @@ class Memory:
     retrieval_count: int = 0      # uses (see MemoryStore.touch), not search hits
     rejection_reason: str = ""
     last_used_day: int = -1
+    tags: list = field(default_factory=list)
 
     @property
     def strength_rank(self) -> int:
@@ -136,6 +146,8 @@ class MemoryStore:
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(memories)")}
         if "last_used_day" not in cols:
             self.db.execute("ALTER TABLE memories ADD COLUMN last_used_day INTEGER NOT NULL DEFAULT -1")
+        if "tags" not in cols:
+            self.db.execute("ALTER TABLE memories ADD COLUMN tags TEXT DEFAULT '[]'")
         # Memory files: index documents and tool outputs logged before the index existed.
         if not self.db.execute("SELECT 1 FROM files_fts LIMIT 1").fetchone():
             for r in self.db.execute("SELECT id, kind, transcript FROM episodes").fetchall():
@@ -229,7 +241,8 @@ class MemoryStore:
             never_consolidate=bool(r["never_consolidate"]),
             consolidated_in=json.loads(r["consolidated_in"]),
             last_probe_result=r["last_probe_result"], retrieval_count=r["retrieval_count"],
-            rejection_reason=r["rejection_reason"], last_used_day=r["last_used_day"])
+            rejection_reason=r["rejection_reason"], last_used_day=r["last_used_day"],
+            tags=json.loads(r["tags"] or "[]"))
 
     def get(self, memory_id: str) -> Memory | None:
         r = self.db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
@@ -267,7 +280,64 @@ class MemoryStore:
         self.db.execute("INSERT INTO memories_fts(id, key, summary, value) VALUES (?,?,?,?)",
                         (mem.id, mem.key.replace("/", " "), mem.summary, mem.value))
         self.db.commit()
+        if mem.tags:
+            self.set_tags(mem.id, mem.tags)
         return mem
+
+    # ------------------------------------------------------------ subject tags
+    def set_tags(self, memory_id: str, tags) -> None:
+        tags = list(dict.fromkeys(t for t in tags if t))
+        self.db.execute("UPDATE memories SET tags = ? WHERE id = ?", (json.dumps(tags), memory_id))
+        self.db.execute("DELETE FROM memory_tags WHERE memory_id = ?", (memory_id,))
+        self.db.executemany("INSERT OR IGNORE INTO memory_tags(memory_id, tag) VALUES (?, ?)",
+                            [(memory_id, t) for t in tags])
+        self.db.commit()
+
+    def tag_counts(self) -> dict:
+        """Every tag in use with its number of active memories, most used first."""
+        rows = self.db.execute("SELECT t.tag, COUNT(*) n FROM memory_tags t JOIN memories m ON m.id = t.memory_id "
+                               "WHERE m.status = 'active' GROUP BY t.tag ORDER BY n DESC, t.tag").fetchall()
+        return {r[0]: r[1] for r in rows}
+
+    def topic_counts(self) -> dict:
+        """Topic tags (the second tag of a memory) in use, most used first."""
+        out: dict = {}
+        for (raw,) in self.db.execute("SELECT tags FROM memories WHERE status = 'active'"):
+            tags = json.loads(raw or "[]")
+            if len(tags) >= 2:
+                out[tags[1]] = out.get(tags[1], 0) + 1
+        return dict(sorted(out.items(), key=lambda kv: -kv[1]))
+
+    def by_tags(self, tags, k: int = 30, exclude=()) -> list[Memory]:
+        """Active memories with any of these tags, most tags matched first (all tags matched =
+        the narrowest set; a partly wrong tag still finds something), then most used."""
+        tags = [t for t in dict.fromkeys(tags) if t]
+        if not tags:
+            return []
+        rows = self.db.execute(
+            "SELECT m.*, COUNT(*) hits FROM memory_tags t JOIN memories m ON m.id = t.memory_id "
+            f"WHERE t.tag IN ({','.join('?' * len(tags))}) AND m.status = 'active' "
+            "GROUP BY m.id ORDER BY hits DESC, m.retrieval_count DESC, m.created_at LIMIT ?",
+            (*tags, k + len(exclude))).fetchall()
+        return [self._row_to_memory(r) for r in rows if r["id"] not in exclude][:k]
+
+    def related(self, memory: Memory, min_shared: int = 2, k: int = 3, exclude=()) -> list[Memory]:
+        """Linked memories: active memories sharing at least `min_shared` tags with this one."""
+        if len(memory.tags) < min_shared:
+            return []
+        out = [m for m in self.by_tags(memory.tags, k=k + 1, exclude=set(exclude) | {memory.id})
+               if len(set(m.tags) & set(memory.tags)) >= min_shared]
+        return out[:k]
+
+    def untagged(self) -> list[Memory]:
+        rows = self.db.execute("SELECT * FROM memories WHERE status = 'active' AND (tags IS NULL OR tags = '[]') "
+                               "ORDER BY created_at").fetchall()
+        return [self._row_to_memory(r) for r in rows]
+
+    def file_text(self, episode_id: int) -> tuple[str, str] | None:
+        """(title, full text) of a memory file."""
+        r = self.db.execute("SELECT title, text FROM files_fts WHERE episode_id = ?", (episode_id,)).fetchone()
+        return (r["title"], r["text"]) if r else None
 
     def update_fields(self, memory_id: str, **fields) -> None:
         for k in ("sources", "consolidated_in"):

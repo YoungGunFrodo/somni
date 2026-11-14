@@ -30,6 +30,18 @@ class DreamResult:
     train: list = field(default_factory=list)
 
 
+def _dream_questions(teacher, memories, n: int) -> list:
+    """(memory, question) pairs. A server teacher answers several requests at once (its slots),
+    so the calls run in parallel there: one at a time took hours for 1,000 memories."""
+    if hasattr(teacher, "url") and len(memories) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(8) as pool:
+            qs = list(pool.map(lambda m: teacher.dream_questions(m, n), memories))
+    else:
+        qs = [teacher.dream_questions(m, n) for m in memories]
+    return [(m, q) for m, mq in zip(memories, qs) for q in mq]
+
+
 def _answers(student, questions):
     """All answers in one batch when the student supports it (same answers, one model load)."""
     if not questions:
@@ -62,7 +74,7 @@ def run_dreaming(system, student, new_memory_ids: list[str], rng: np.random.Gene
         prot, _ = split([m for m in store.eligible_for_consolidation()
                          if m.consolidated_in and m.id not in seeds], day, cfg)
         # Teacher phase, then student phase (batched): on one GPU the two models take turns.
-        asked = [(m, q[0]) for m in prot for q in [system.teacher.dream_questions(m, 1)] if q]
+        asked = _dream_questions(system.teacher, prot, 1)
         got = _answers(student, [q for _, q in asked])
         slipped = [m for (m, _), a in zip(asked, got) if not exact(a.value, m.value)]
         slipped.sort(key=lambda m: salience(m, day, cfg.half_life_days), reverse=True)
@@ -78,7 +90,7 @@ def run_dreaming(system, student, new_memory_ids: list[str], rng: np.random.Gene
     old, _rest = split(old, day, cfg)   # dream replay covers protected memories only
     for r in range(cfg.dream_rounds):
         data, passed, attempts = [], 0, 0
-        asked = [(m, q) for m in seeds.values() for q in system.teacher.dream_questions(m, 3)]  # teacher
+        asked = _dream_questions(system.teacher, list(seeds.values()), 3)                     # teacher
         got = _answers(student, [q for _, q in asked])                                          # student
         for (m, q), ans in zip(asked, got):
             ok = exact(ans.value, m.value)

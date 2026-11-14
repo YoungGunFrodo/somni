@@ -22,6 +22,11 @@ def match_strength(question: str, context) -> float:
 
 
 class Orchestrator:
+    # Subject tags (sleep/tagging.py): recall also scans the titles of memories carrying the tags
+    # the question names, and adds memories linked to the best hit (2+ shared tags). Off until
+    # measured; the benchmark turns it on with --tags.
+    use_tags: bool = False
+
     def __init__(self, store: MemoryStore, student, use_memory: bool = True):
         self.store = store
         self.student = student
@@ -38,12 +43,32 @@ class Orchestrator:
                     seen.add(m.id)
                     merged.append(m)
         merged = merged[:k]
+        if self.use_tags and hasattr(self.store, "by_tags"):
+            merged += self._by_tags(question, merged, seen)
         if files and hasattr(self.store, "search_files"):
             from ..memory.store import Memory
             for f in self.store.search_files(question, k=files):
                 merged.append(Memory(key=f"file/{f['episode_id']}", type="file", summary=f["snippet"],
                                      strength="verified", status="active", id=f"file:{f['episode_id']}"))
         return merged
+
+    def _by_tags(self, question: str, merged: list, seen: set, extra: int = 3) -> list:
+        from ..sleep.tagging import question_tags
+        if getattr(self, "_vocab_n", 0) % 200 == 0:          # tag list refreshed now and then
+            self._vocab = self.store.tag_counts()
+        self._vocab_n = getattr(self, "_vocab_n", 0) + 1
+        terms = {w for w in re.findall(r"[a-z0-9]+", question.lower()) if len(w) > 2 and w not in _STOP}
+        overlap = lambda m: sum(w in (m.key + " " + m.summary).lower() for w in terms)
+        out = []
+        qt = question_tags(question, self._vocab)
+        if qt:                                   # scan the titles under the question's tags
+            cands = [m for m in self.store.by_tags(qt, k=30, exclude=seen) if overlap(m) > 0]
+            out += sorted(cands, key=lambda m: -overlap(m))[:2]
+        if merged:                               # linked memories of the best hit
+            out += self.store.related(merged[0], k=2, exclude=seen | {m.id for m in out})
+        for m in out:
+            seen.add(m.id)
+        return out[:extra]
 
     def ask(self, question: str, day: int = 0, use_memory: bool | None = None) -> tuple[Answer, int]:
         use_memory = self.use_memory if use_memory is None else use_memory

@@ -409,3 +409,53 @@ still 100%). Toy numbers are pipeline dynamics, not LLM performance.
   44333, def, git clone, prime, leap year); 2 grading artefacts (eight vs 8, CO2). The 30-passage
   run (C) did not show this: the damage grows with night size, and rehearsal (158 items) was
   repeated ~23x. Fix next: no summary-template answers; a larger, more varied rehearsal pool.
+- 2026-11-12 15:00: experiment D (30 passages, new rehearsal + speedups) STOPPED by the user's request
+  (gaming) during memory formation; rerun it. Research (locality in knowledge editing): plan is
+  WISE-style per-question routing for each night's expert (arXiv 2405.14768): score = expert
+  activation norm over the prompt, margin loss (memory questions high, rehearsal low, gap), hard
+  on/off at threshold = min score over training memory questions; off = exactly the base model.
+  Not built yet; proposed to the user, waiting for their go.
+
+**2026-11-13: WISE-style routing built** (`expert_route`, benchmark `--route`; off by default until proven).
+Score per expert = mean over prompt tokens of |A x|^2 on the RMS-normalised input, per rank (~1/3 at
+init), averaged over layers. Training adds a margin loss: rehearsal (origin "base") <= 0.1, new memory
+>= 1.0, in-batch gap 0.5, weight 1. After training, threshold = geometric midpoint of rehearsal p95 and
+memory p5 on a 400+400 sample of the training prompts (rule fixed in advance, never tuned on evals);
+saved per expert in experts.json `route` (None = always on, e.g. older experts). Inference
+(HFStudent._route): one prompt pass scores each question, then each expert is multiplied by 0/1 per
+question, so a routed-off question gets exactly the base model. Check: `scripts/check_route.py`
+(tiny model; passes). Experiment E = recipe C + routing, 30 passages, reuse exp-c, 2 epochs.
+Experiment E result (30 passages): no context 33.5% (= C), lookup 79.1%, reading 97.5% (= base),
+general 92.5% (= base). Expert switched on: SQuAD 100%, SQuAD+lookup 100%, reading 0%, general 0%.
+Training calibration: memory p5 1.14, rehearsal p95 0.25, threshold 0.537. 2944 s training.
+2026-11-13: full run v4 started (200 passages, --route, reuse v3, 2 epochs) -> models/squad/v4.log.
+2026-11-13: v4 STOPPED at step 3300/11498 (user agreed: next full run includes routing anyway; the
+route-on rate for general probes shows whether routing holds at 200 passages).
+Built (flags, all off by default): subject tags (`sleep/tagging.py`, store `memory_tags`,
+`by_tags`/`related`, recall `Orchestrator.use_tags`; user's Zettelkasten idea, multi-tag), SEAL/
+Google implications (`consolidation.implication_examples`, `<home>/implications.json`), and the
+dreaming fix: the benchmark never called run_dreaming, so `--dreaming` was a no-op before today.
+Dreaming teacher calls now run in parallel. Coverage measured on v3 (200 passages): answer in
+recall context 94.1%, in some memory 78%, in training pairs 69%, trained no-context 27%.
+Experiment H = E + --implications --tags --dreaming (30 passages) -> models/squad/exp-h.log.
+Tags v1 (teacher writes 2-4 tags per fact) on exp H: 98/202 memories tagged (broken replies lost
+whole sources), fragmented tags ("school-type" vs "type-of-school"). Still: lookup without training
+80.4 -> 82.3% with tag recall. Tags v2 (now in code): field (fixed list) + topic (teacher, once per
+source, topics reused) + subject (key's first part, no model call). Measure with
+`scripts/tag_lookup_eval.py <run dir>` (re-tags a copy of the store; lookup tags off vs on).
+Experiment H result (30 passages): no context 36.7% (E 33.5, base 8.9), lookup 77.2% (E 79.1; base
+80.4, base with tags v1 82.3), reading 97.5 = base, general 92.5 = base; expert on: SQuAD 100%,
+general 2.5%, reading 0%. Dreaming pass rate 91.2 -> 92.0%, 2157 s. Tags v2 lookup eval: 80.4 both
+with and without tags (search already finds the answer for 98.1%); bug found: Qwen3 thinks first
+and the 120-token tag call returned nothing (all fields "general"); now 1500 tokens, temperature 0,
+document title = topic. Known gap: trained + lookup reads ~3 pts worse than base (expert is on for
+SQuAD questions with context).
+2026-11-13: full run v5 started: 200 passages, --route --implications --tags --dreaming, reuse v3.
+v5 result (2026-11-14, 200 passages, routing + implications + tags + dreaming, 2 epochs): no context
+26.3% (+15.7; v3 26.7), lookup 75.3% (base + lookup 76.3), reading 97.5 = base, **general 90.0%
+(v3 75.0, base 92.5): routing fixed forgetting at scale.** Expert on: SQuAD 96.5%, SQuAD+lookup 100%,
+reading 0%, general 2.5%. Thresholds 0.715 / 0.644 / 0.526 (after training, dream round 1, round 2).
+Dreaming rounds 83.4 -> 91.7% pass, 2630 attempts, 10,837 s; training 16,073 s, 19,094 examples.
+Implications + dreaming gave NO gain at 200 passages (dream questions copy the memory's wording).
+README updated and pushed with the user's go (2026-11-14). Next: natural-phrasing dream questions,
+the ~1 pt trained+lookup gap, LLM-judge scoring for a fair Google comparison.

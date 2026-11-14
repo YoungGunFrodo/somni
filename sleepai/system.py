@@ -95,7 +95,7 @@ def build_real_system(config: Config):
         # in-process ("hf"): llama-server cannot run these experts.
         from .models.experts import ExpertTrainer
         trainer = ExpertTrainer(config.base_model, str(config.home_path / "adapters"),
-                                gated=config.expert_gate)
+                                gated=config.expert_gate, route=config.expert_route)
     else:
         trainer = PeftTrainer(config.base_model, str(config.home_path / "adapters"))
     system = System(config, teacher, trainer, lambda: HFStudent(config.base_model),
